@@ -1,97 +1,76 @@
 #include <stdio.h>
-#include <stdlib.h>
 #include <unistd.h>
-#include <fcntl.h>
 #include <sys/types.h>
-#include <sys/stat.h>
+#include <sys/wait.h>
 #include <time.h>
-#include <string.h>
+#include <stdlib.h>
+#include "inst.h"
 
-struct record {
-    void *this_fn;
-    void *call_site;
-    clock_t start_time;
-    clock_t end_time;
-};
+void monitor_pipe(int pipe_fd);
 
-/*
- * Handles function entry and records function call information.
- * @param this_fn: Pointer to the current function.
- * @param call_site: Pointer to the call site.
+/**
+ * sends call information to the monitor process as shown in directions
+ * 
+ * @param pid       process ID
+ * @param event     type of event
+ * @param this_fn   pointer to the function where the tracing is applied
+ * @param call_site pointer to the function that triggers the tracing
  */
-void __cyg_profile_func_enter(void *this_fn, void *call_site) {
-    struct record rec;
-    rec.this_fn = this_fn;//stores the current function name in the record
-	rec.call_site = call_site;//stores the call site information in the record
-	rec.start_time = clock();//records the start time of the function execution
-	rec.end_time = 0;//initializes the end time to 0 to be used later
-	
-	//gets program name from the environment variable "_"
-    char *program_name = getenv("_");
-    if (program_name == NULL) {
-        fprintf(stderr, "unable to get program name\n");
-        exit(1);
-    }
-
-	//open file
-    char calltrace_file[100];//make sure the file can have up to 100 characters in the name
-    snprintf(calltrace_file, sizeof(calltrace_file), "%s.calltrace", program_name);
-    int fd = open(calltrace_file, O_CREAT | O_WRONLY | O_APPEND, S_IRUSR | S_IWUSR);
-    if (fd == -1) {
-        perror("unable to open calltrace file");
-        exit(1);
-    }
-
-    //write to file
-    ssize_t bytes_written = write(fd, &rec, sizeof(struct record));
-    if (bytes_written != sizeof(struct record)) {
-        perror("unable to write to calltrace file");
-        close(fd);
-        exit(1);
-    }
-
-    close(fd);
+void send_data(int pid, const char *event, void (*this_fn)(), void (*call_site)()) {
+    fprintf(stderr, "Monitor: [%s] Process: %d, this_fn: %p, call_site: %p, clock: %ld\n",
+            event, pid, this_fn, call_site, clock());
 }
 
-/*
- * Handles function exit and updates the end time of the recorded function call.
- * @param this_fn: Pointer to the current function.
- * @param call_site: Pointer to the call site.
+/**
+ * instruments the functions
+ * 
+ * @return int error code
  */
-void __cyg_profile_func_exit(void *this_fn, void *call_site) {
-	//gets program name from the environment variable "_"
-    char *program_name = getenv("_");
-    if (program_name == NULL) {
-        fprintf(stderr, "unable to get program name\n");
-        exit(1);
+void instrument_functions() {
+    int pipe_fd[2];
+
+    if (pipe(pipe_fd) == -1) {
+        perror("Pipe creation failed");
+        exit(-1);
     }
 
-    //open the call trace file for updating end_time
-    char calltrace_file[100];
-    snprintf(calltrace_file, sizeof(calltrace_file), "%s.calltrace", program_name);
-    int fd = open(calltrace_file, O_RDWR);
-    if (fd == -1) {
-        perror("unable to open calltrace file");
-        exit(1);
-    }
+    pid_t monitor_pid = fork();
 
-    //finds the record in the call trace file and updates its end_time
-    struct record rec;
-    ssize_t bytes_read;//keeps track of number of bytes read
-    while ((bytes_read = read(fd, &rec, sizeof(struct record)) == sizeof(struct record))) {
-		//checks if our record's this_fn and call_site match the one in the file
-        if (rec.this_fn == this_fn && rec.call_site == call_site) {
-			//when found, update end_time
-            rec.end_time = clock();//find end_time
-            lseek(fd, -sizeof(struct record), SEEK_CUR);//updates the file pointer back to the beginning of the record we just found
-            ssize_t bytes_written = write(fd, &rec, sizeof(struct record));//updates end_time
-            if (bytes_written != sizeof(struct record)) {
-                perror("unable to update calltrace file");
-            }
-            break;
-        }
-    }
+    if (monitor_pid == -1) {
+        perror("Monitor process creation failed");
+        exit(-2);
+    } else if (monitor_pid == 0) {
+        close(pipe_fd[1]);//close write end
+        monitor_pipe(pipe_fd[0]);//read end
+        close(pipe_fd[0]); //close read end
+    } else {
+        close(pipe_fd[0]);//close the read end
 
-    close(fd);
+        send_data(getpid(), "enter", instrument_functions, send_data);
+        send_data(getpid(), "exit", instrument_functions, send_data);
+
+        close(pipe_fd[1]);//close the write end after instrumentation
+        wait(NULL);//wait for monitor process to finish
+    }
 }
 
+/**
+ * monitors pipe for incoming call information and prints the monitored data to the standard error
+ * 
+ * @param pipe_fd the file descriptor of the pipe to monitor
+ */
+void monitor_pipe(int pipe_fd) {
+    char buffer[100];
+    ssize_t bytes_read;
+
+    while ((bytes_read = read(pipe_fd, buffer, sizeof(buffer) - 1/*ensure null char*/)) > 0) {
+        buffer[bytes_read] = '\0';//null char for string
+        const char *event = "enter";
+        int pid = getpid();
+        void *this_fn = instrument_functions;
+        void *call_site = send_data;
+		//print monitor process to standard error as shown in instructions
+        fprintf(stderr, "Monitor: [%s] Process: %d, this_fn: %p, call_site: %p\nclock: %ld\n",
+				event, pid, this_fn, call_site, clock());
+    }
+}
